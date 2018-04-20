@@ -1,4 +1,3 @@
-from time import sleep
 import cv2
 import numpy as np
 import math
@@ -6,11 +5,19 @@ import win32gui
 import win32ui
 import win32con
 import win32api
+import matplotlib.pyplot as plt
+from calibration import calibrate, undistort
+
+
+mtx, dist = calibrate()
+
+# demovideo
+# cap = cv2.VideoCapture('solidWhiteRight.mp4')
+cap = cv2.VideoCapture('project_video.mp4')
 
 # https://www.programcreek.com/python/example/14102/win32gui.GetDesktopWindow
-
-
-def grab_screen(region=(0, 53, 960, 590)):
+# mahdollisia videoita tai pelejeä varten ruudunkaappaus -- ei käytössä
+def grab_screen(region=(0, 100, 920 , 560)):
 
     hwin = win32gui.GetDesktopWindow()
 
@@ -40,121 +47,94 @@ def grab_screen(region=(0, 53, 960, 590)):
     memdc.DeleteDC()
     win32gui.ReleaseDC(hwin, hwindc)
     win32gui.DeleteObject(bmp.GetHandle())
-    return cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
 
+    return cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGRA2RGB), cv2.COLOR_BGR2RGB)
+
+# rajataan kuvaa
+def region_of_interest(canny_image, original_image):
+
+    if 'width' not in locals() or 'height' not in locals():
+        width = canny_image.shape[1]
+        height = canny_image.shape[0]
+        vertices = [
+            (width * 0.10, height), 
+            (width / 2.2, height / 1.8), 
+            (width - (width / 2.2) , height / 1.8), 
+            (width * 0.90, height)
+            ]
+        # vertices1 = [(0.0, height),(width* 0.20, height), (0.0, 0.0),(width* 0.20, 0.0)]
+        # vertices2 = [(width, height),(width* 0.80, height), (width, 0.0),(width* 0.80, 0.0)]
+
+    mask = np.zeros_like(canny_image)    
+
+
+    masked_image = cv2.bitwise_and(canny_image, mask)
+    mask_for_regular = np.zeros_like(original_image)
+    img = cv2.fillConvexPoly(mask_for_regular, np.array([vertices], np.int32), (255,170,255))
+    regular_masked_image = cv2.addWeighted(original_image, 1, img, 0.1, 0.0)
+
+    
+
+
+    return masked_image, regular_masked_image
 
 def process_img(original_image):
 
-    if 'width' not in locals() or 'height' not in locals():
-        width = original_image.shape[1]
-        height = original_image.shape[0]
-        region_of_interest_vertices = [
-            (0, height), (width / 2, height / 2), (width, height)]
+    undistorted_image = undistort(original_image, mtx, dist)
 
-    left_line_x = []
-    left_line_y = []
-    right_line_x = []
-    right_line_y = []
-
-    gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+    gray_image = cv2.cvtColor(undistorted_image, cv2.COLOR_BGR2GRAY)
     canny_image = cv2.Canny(gray_image, 100, 200)
-    cropped_image = region_of_interest(
-        canny_image, np.array([region_of_interest_vertices], np.int32))
+    warped_image = change_perspective(canny_image)
+    cropped_image, regular_masked_image = region_of_interest(warped_image, original_image)
 
-    lines = cv2.HoughLinesP(
-        cropped_image,
-        rho=6,
-        theta=np.pi/60,
-        threshold=160,
-        lines=np.array([]),
-        minLineLength=40,
-        maxLineGap=25
-    )
+    # palautetaan myös kaistaviivat
 
-    for line in lines:
-        for x1, y1, x2, y2 in line:
-            slope = (y2 - y1) / (x2 - x1) 
-            if math.fabs(slope) < 0.5:  
-                continue
-            if slope <= 0: 
-                left_line_x.extend([x1, x2])
-                left_line_y.extend([y1, y2])
-            else: 
-                right_line_x.extend([x1, x2])
-                right_line_y.extend([y1, y2])
- 
-    min_y = int(original_image.shape[0] * (3 / 5))
-    max_y = int(original_image.shape[0])
+    return cropped_image, regular_masked_image
 
-    poly_left = np.poly1d(np.polyfit(
-        left_line_y,
-        left_line_x,
-        deg=1
-    ))
-    left_x_start = int(poly_left(max_y))
-    left_x_end = int(poly_left(min_y))
-        
-    poly_right = np.poly1d(np.polyfit(
-        right_line_y,
-        right_line_x,
-        deg=1
-    ))
-    right_x_start = int(poly_right(max_y))
-    right_x_end = int(poly_right(min_y))
+def change_perspective(original_image):
+    image_size = (original_image.shape[1], original_image.shape[0])
 
-    processed_lines = [[
-        [left_x_start, max_y, left_x_end, min_y],
-        [right_x_start, max_y, right_x_end, min_y],
-    ]]
+    bot_width = .76
+    mid_width = .08
+    height_pct = .62
+    bottom_trim = .935
+    offset = image_size[0]*.25
+    src = np.float32([[original_image.shape[1]*(.5 - mid_width/2), original_image.shape[0]*height_pct], [original_image.shape[1]*(.5 + mid_width/2), original_image.shape[0]*height_pct],\
+    [original_image.shape[1]*(.5 + bot_width/2), original_image.shape[0]*bottom_trim], [original_image.shape[1]*(.5 - bot_width/2), original_image.shape[0]*bottom_trim]])
+    dst = np.float32([[offset, 0], [image_size[0] - offset, 0], [image_size[0] - offset, image_size[1]], [offset, image_size[1]]])
+    M = cv2.getPerspectiveTransform(src, dst)
 
-    return cropped_image, processed_lines
+    #transform the image to birds eye view given the transform matrix
+    warped = cv2.warpPerspective(original_image, M, (image_size[0], image_size[1]))
+    return warped
+
+def lanes():
+    return 0
 
 
-def region_of_interest(img, vertices):
+while (cap.isOpened()): #True:#
+    ret, frame = cap.read()
 
-    # maaritellaan tyhja matriisi joka tasmaa kuvan korkeuteen/leveyteen
-    mask = np.zeros_like(img)
+    # original_image = grab_screen()
+    cropped_image, original_image_masked = process_img(frame)
+    warped_image = change_perspective(cropped_image)
 
-    # haetaan kuvan varikanavat
-    channel_count = 1
+    # histogram = np.sum(warped_image[600:,:], axis=0)
+    # plt.plot(histogram)
+    # plt.title("histogram")
+    # plt.show()
+    # hsv = cv2.cvtColor(warped_image,cv2.COLOR_BGR2HSV)
+    # hist = cv2.calcHist( [hsv], [0, 1], None, [180, 256], [0, 180, 0, 256] )
+    # plt.imshow(hist,interpolation = 'nearest')
+    # plt.show()
 
-    # luodaan tasmaava vari samoilla varikanavilla
-    match_mask_color = (255,) * channel_count
-
-    # taytetaan polygoni
-    cv2.fillPoly(mask, vertices, match_mask_color)
-
-    # palautetaan kuva jossa vain maskatut pikselit tasmaavat
-    masked_image = cv2.bitwise_and(img, mask)
-    return masked_image
-
-
-def draw_lines(img, vertices):
-    # luodaan kaistan piirrolle musta kuva
-    line_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
+    
 
 
-    # piirretaan kaistaviivat
-    for line in processed_lines:
-        for x1, y1, x2, y2 in line:
-            cv2.line(line_img, (x1, y1), (x2, y2), [250, 250, 0], 5)
+    cv2.imshow("cropped image", cropped_image)
+    # cv2.imshow("warped image", warped_image)       
+    cv2.imshow("original image masked", original_image_masked)
 
-    # lisataan alkuperaiseen kuvaan kaistaviivat
-    img = cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0)
-
-    return img
-
-
-while True:
-
-    original_image = grab_screen()
-    cropped_image, processed_lines = process_img(original_image)
-
-    if processed_lines is not None:
-                                                # piirra viivat
-        image_with_lines = draw_lines(original_image, processed_lines)
-        cv2.imshow("frame", image_with_lines)
-    cv2.imshow("asas", cropped_image)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
